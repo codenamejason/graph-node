@@ -1,0 +1,5 @@
+drop index graphman_command_executions_updated_at_idx;
+drop index graphman_command_executions_status_idx;
+drop index graphman_command_executions_kind_idx;
+
+drop table public.graphman_command_executions;
