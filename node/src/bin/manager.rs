@@ -27,13 +27,29 @@ use graph_node::{
     MetricsContext,
 };
 use graph_store_postgres::connection_pool::PoolCoordinator;
+use graph_store_postgres::graphman_store::GraphmanStore;
 use graph_store_postgres::ChainStore;
 use graph_store_postgres::{
     connection_pool::ConnectionPool, BlockStore, NotificationSender, Shard, Store, SubgraphStore,
     SubscriptionManager, PRIMARY_SHARD,
 };
+use graphman::commands::deployment::info::DeploymentInfoCommand;
+use graphman::commands::deployment::info::DeploymentStatusSelector;
+use graphman::commands::deployment::pause::PauseDeploymentCommand;
+use graphman::commands::deployment::restart::RestartDeploymentCommand;
+use graphman::commands::deployment::resume::ResumeDeploymentCommand;
+use graphman::CommandKind;
+use graphman::GraphmanContext;
+use graphman_extensions::GraphmanExtensionContext;
+use graphman_extensions::HandleBrokenExecutions;
+use graphman_extensions::IdentifyCommand;
+use graphman_extensions::PreventDuplicateExecutions;
+use graphman_extensions::TrackExecution;
+use graphman_primitives::GraphmanCommand;
+use graphman_primitives::GraphmanLayer;
 use lazy_static::lazy_static;
 use std::{collections::HashMap, num::ParseIntError, sync::Arc, time::Duration};
+
 const VERSION_LABEL_KEY: &str = "version";
 
 git_testament!(TESTAMENT);
@@ -1100,30 +1116,7 @@ async fn main() -> anyhow::Result<()> {
             status,
             used,
             all,
-        } => {
-            let (primary, store) = if status {
-                let (store, primary) = ctx.store_and_primary();
-                (primary, Some(store))
-            } else {
-                (ctx.primary_pool(), None)
-            };
-
-            match deployment {
-                Some(deployment) => {
-                    commands::info::run(primary, store, deployment, current, pending, used).err();
-                }
-                None => {
-                    if all {
-                        let deployment = DeploymentSearch::All;
-                        commands::info::run(primary, store, deployment, current, pending, used)
-                            .err();
-                    } else {
-                        bail!("Please specify a deployment or use --all to list all deployments");
-                    }
-                }
-            };
-            Ok(())
-        }
+        } => execute_deployment_info(ctx, deployment, current, pending, status, used, all).await,
         Unused(cmd) => {
             let store = ctx.subgraph_store();
             use UnusedCommand::*;
@@ -1173,27 +1166,9 @@ async fn main() -> anyhow::Result<()> {
             let sender = ctx.notification_sender();
             commands::assign::reassign(ctx.primary_pool(), &sender, &deployment, node)
         }
-        Pause { deployment } => {
-            let sender = ctx.notification_sender();
-            let pool = ctx.primary_pool();
-            let locator = &deployment.locate_unique(&pool)?;
-            commands::assign::pause_or_resume(pool, &sender, locator, true)
-        }
-
-        Resume { deployment } => {
-            let sender = ctx.notification_sender();
-            let pool = ctx.primary_pool();
-            let locator = &deployment.locate_unique(&pool).unwrap();
-
-            commands::assign::pause_or_resume(pool, &sender, locator, false)
-        }
-        Restart { deployment, sleep } => {
-            let sender = ctx.notification_sender();
-            let pool = ctx.primary_pool();
-            let locator = &deployment.locate_unique(&pool).unwrap();
-
-            commands::assign::restart(pool, &sender, locator, sleep)
-        }
+        Pause { deployment } => execute_pause_deployment(ctx, deployment).await,
+        Resume { deployment } => execute_resume_deployment(ctx, deployment).await,
+        Restart { deployment, sleep } => execute_restart_deployment(ctx, deployment, sleep).await,
         Rewind {
             force,
             sleep,
@@ -1584,4 +1559,223 @@ async fn main() -> anyhow::Result<()> {
 
 fn parse_duration_in_secs(s: &str) -> Result<Duration, ParseIntError> {
     Ok(Duration::from_secs(s.parse()?))
+}
+
+// A temporary conversion until all the commands are migrated to the core crate.
+fn make_graphman_context(ctx: Context) -> GraphmanContext {
+    let logger = ctx.logger.clone();
+    let notification_sender = ctx.notification_sender();
+    let (store, pool) = ctx.store_and_primary();
+
+    GraphmanContext {
+        pool,
+        notification_sender,
+        store,
+        logger,
+    }
+}
+
+async fn execute_deployment_info(
+    ctx: Context,
+    deployment: Option<DeploymentSearch>,
+    current: bool,
+    pending: bool,
+    status: bool,
+    used: bool,
+    all: bool,
+) -> anyhow::Result<()> {
+    use graphman::deployment_search::DeploymentFilters;
+    use graphman::deployment_search::DeploymentSelector;
+
+    let deployment = match deployment {
+        Some(deployment) => make_deployment_selector(deployment),
+        None if all => DeploymentSelector::All,
+        None => bail!("Please specify a deployment or use --all to list all deployments"),
+    };
+
+    let filters = DeploymentFilters {
+        included_versions: Some(make_deployment_version_filter(current, pending, used)),
+    };
+
+    let status = if !status {
+        DeploymentStatusSelector::Skip
+    } else {
+        DeploymentStatusSelector::Load
+    };
+
+    let command = DeploymentInfoCommand {
+        deployment,
+        filters,
+        status,
+    };
+
+    let ctx = make_graphman_context(ctx);
+    let deployments = command.execute(ctx).await?;
+
+    print_deployments(deployments);
+
+    Ok(())
+}
+
+async fn execute_pause_deployment(
+    ctx: Context,
+    deployment: DeploymentSearch,
+) -> anyhow::Result<()> {
+    let deployment = make_deployment_selector(deployment);
+    let command = PauseDeploymentCommand { deployment };
+    let ctx = make_graphman_context(ctx);
+
+    let _paused = command.execute(ctx).await?;
+
+    println!("Operation completed successfully");
+    Ok(())
+}
+
+async fn execute_resume_deployment(
+    ctx: Context,
+    deployment: DeploymentSearch,
+) -> anyhow::Result<()> {
+    let deployment = make_deployment_selector(deployment);
+    let command = ResumeDeploymentCommand { deployment };
+    let ctx = make_graphman_context(ctx);
+
+    let _resumed = command.execute(ctx).await?;
+
+    println!("Operation completed successfully");
+    Ok(())
+}
+
+async fn execute_restart_deployment(
+    ctx: Context,
+    deployment: DeploymentSearch,
+    delay: Duration,
+) -> anyhow::Result<()> {
+    let deployment = make_deployment_selector(deployment);
+    let command = RestartDeploymentCommand { deployment, delay };
+    let ctx = make_graphman_context(ctx);
+    let store = Arc::new(GraphmanStore::new(ctx.pool.clone()));
+    let ctx = GraphmanExtensionContext::new(ctx);
+
+    let _restarted = command
+        .layer(IdentifyCommand::new(CommandKind::RestartDeployment.into()))
+        .layer(HandleBrokenExecutions::new(store.clone()))
+        .layer(PreventDuplicateExecutions::new(store.clone()))
+        .layer(TrackExecution::new(store))
+        .execute(ctx)
+        .await?;
+
+    println!("Operation completed successfully");
+    Ok(())
+}
+
+fn make_deployment_selector(
+    deployment: DeploymentSearch,
+) -> graphman::deployment_search::DeploymentSelector {
+    use graphman::deployment_search::DeploymentSelector::*;
+
+    match deployment {
+        DeploymentSearch::Name { name } => Subgraph { name },
+        DeploymentSearch::Hash { hash, shard } => Ipfs { hash, shard },
+        DeploymentSearch::All => All,
+        DeploymentSearch::Deployment { namespace } => Namespace(namespace),
+    }
+}
+
+fn make_deployment_version_filter(
+    current: bool,
+    pending: bool,
+    used: bool,
+) -> graphman::deployment_search::DeploymentVersionFilter {
+    use graphman::deployment_search::DeploymentVersionFilter::*;
+
+    match (current || used, pending || used) {
+        (false, false) => All,
+        (true, false) => Current,
+        (false, true) => Pending,
+        (true, true) => Used,
+    }
+}
+
+fn print_deployments(deployments: Vec<graphman::commands::deployment::info::DeploymentInfo>) {
+    use graph_node::manager::display::List;
+
+    let mut headers = vec![
+        "name",
+        "status",
+        "id",
+        "namespace",
+        "shard",
+        "active",
+        "chain",
+        "node_id",
+    ];
+
+    let include_status_headers = deployments.iter().any(|x| x.status.is_some());
+
+    if include_status_headers {
+        headers.extend(vec![
+            "paused",
+            "synced",
+            "health",
+            "earliest block",
+            "latest block",
+            "chain head block",
+        ]);
+    }
+
+    let mut list = List::new(headers);
+
+    for deployment in deployments {
+        const EMPTY: &str = "---";
+
+        let mut row = vec![
+            deployment.name,
+            deployment.version_status,
+            deployment.hash,
+            deployment.namespace,
+            deployment.shard,
+            deployment.is_active.to_string(),
+            deployment.chain,
+            deployment.node_id.unwrap_or(EMPTY.to_owned()),
+        ];
+
+        match deployment.status {
+            Some(status) => {
+                row.extend(vec![
+                    status
+                        .is_paused
+                        .map(|x| x.to_string())
+                        .unwrap_or(EMPTY.to_owned()),
+                    status.is_synced.to_string(),
+                    status.health.as_str().to_string(),
+                    status.earliest_block_number.to_string(),
+                    status
+                        .latest_block
+                        .as_ref()
+                        .map(|b| b.number.to_string())
+                        .unwrap_or(EMPTY.to_owned()),
+                    status
+                        .chain_head_block
+                        .as_ref()
+                        .map(|b| b.number.to_string())
+                        .unwrap_or(EMPTY.to_owned()),
+                ]);
+            }
+            None if include_status_headers => {
+                row.extend(vec![
+                    EMPTY.to_owned(),
+                    EMPTY.to_owned(),
+                    EMPTY.to_owned(),
+                    EMPTY.to_owned(),
+                    EMPTY.to_owned(),
+                    EMPTY.to_owned(),
+                ]);
+            }
+            None => {}
+        }
+
+        list.append(row);
+    }
+
+    list.render();
 }
