@@ -5,6 +5,7 @@ use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::Timestamptz;
 use diesel::sql_types::{Bytea, Nullable, Text};
 use diesel_derives::{AsExpression, FromSqlRow};
+use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::time::Duration;
 use std::{fmt, str::FromStr};
@@ -20,7 +21,7 @@ use crate::prelude::{r, BigInt, TryFromValue, Value, ValueMap};
 use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
 
 /// A simple marker for byte arrays that are really block hashes
-#[derive(Clone, Default, PartialEq, Eq, Hash, FromSqlRow, AsExpression)]
+#[derive(Clone, Default, PartialEq, Eq, Hash, FromSqlRow, AsExpression, Serialize, Deserialize)]
 #[diesel(sql_type = Bytea)]
 pub struct BlockHash(pub Box<[u8]>);
 
@@ -131,7 +132,7 @@ impl ToSql<Bytea, Pg> for BlockHash {
 /// A block hash and block number from a specific Ethereum block.
 ///
 /// Block numbers are signed 32 bit integers
-#[derive(Clone, CheapClone, PartialEq, Eq, Hash)]
+#[derive(Clone, CheapClone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockPtr {
     pub hash: BlockHash,
     pub number: BlockNumber,

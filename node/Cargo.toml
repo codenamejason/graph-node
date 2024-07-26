@@ -33,6 +33,10 @@ graph-server-json-rpc = { path = "../server/json-rpc" }
 graph-server-websocket = { path = "../server/websocket" }
 graph-server-metrics = { path = "../server/metrics" }
 graph-store-postgres = { path = "../store/postgres" }
+graphman = { workspace = true }
+graphman-primitives = { workspace = true }
+graphman-extensions = { workspace = true }
+graphman-server = { workspace = true }
 serde = { workspace = true }
 shellexpand = "3.1.0"
 termcolor = "1.4.1"

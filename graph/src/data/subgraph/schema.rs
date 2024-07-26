@@ -19,7 +19,7 @@ use crate::util::stable_hash_glue::impl_stable_hash;
 
 pub const POI_TABLE: &str = "poi2$";
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubgraphHealth {
     /// Syncing without errors.
