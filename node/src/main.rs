@@ -268,7 +268,7 @@ async fn main() {
         &logger_factory,
     );
 
-    start_graphman_server(opt.graphman_port, graphman_server_config);
+    start_graphman_server(opt.graphman_port, graphman_server_config).await;
 
     let launch_services = |logger: Logger, env_vars: Arc<EnvVars>| async move {
         let block_store = network_store.block_store();
@@ -544,7 +544,7 @@ async fn main() {
     graph::futures03::future::pending::<()>().await;
 }
 
-fn start_graphman_server(port: u16, config: Option<GraphmanServerConfig>) {
+async fn start_graphman_server(port: u16, config: Option<GraphmanServerConfig<'_>>) {
     let Some(config) = config else {
         return;
     };
@@ -552,7 +552,10 @@ fn start_graphman_server(port: u16, config: Option<GraphmanServerConfig>) {
     let server = GraphmanServer::new(config)
         .unwrap_or_else(|err| panic!("Invalid graphman server configuration: {err}"));
 
-    let _server_manager = server.start(port);
+    server
+        .start(port)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to start graphman server: {err}"));
 }
 
 fn make_graphman_server_config<'a>(

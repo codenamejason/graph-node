@@ -4,4 +4,7 @@ use thiserror::Error;
 pub enum GraphmanServerError {
     #[error("invalid auth token: {0}")]
     InvalidAuthToken(anyhow::Error),
+
+    #[error("I/O error: {0}")]
+    Io(#[source] anyhow::Error),
 }

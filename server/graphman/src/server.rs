@@ -15,6 +15,7 @@ use graph_store_postgres::graphman_store::GraphmanStore;
 use graph_store_postgres::NotificationSender;
 use graph_store_postgres::Store;
 use slog::{info, Logger};
+use tokio::sync::Notify;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::AuthToken;
@@ -49,7 +50,7 @@ pub struct GraphmanServerConfig<'a> {
 }
 
 pub struct GraphmanServerManager {
-    handle: tokio::task::JoinHandle<()>,
+    notify: Arc<Notify>,
 }
 
 impl GraphmanServer {
@@ -89,7 +90,7 @@ impl GraphmanServer {
         })
     }
 
-    pub fn start(self, port: u16) -> GraphmanServerManager {
+    pub async fn start(self, port: u16) -> Result<GraphmanServerManager, GraphmanServerError> {
         let Self {
             pool,
             notification_sender,
@@ -134,22 +135,28 @@ impl GraphmanServer {
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-        let handle = tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .unwrap_or_else(|err| panic!("Failed to bind graphman tcp listener: {err}"));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|err| GraphmanServerError::Io(err.into()))?;
 
+        let notify = Arc::new(Notify::new());
+        let notify_clone = notify.clone();
+
+        tokio::spawn(async move {
             axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    notify_clone.notified().await;
+                })
                 .await
                 .unwrap_or_else(|err| panic!("Failed to start graphman server: {err}"));
         });
 
-        GraphmanServerManager { handle }
+        Ok(GraphmanServerManager { notify })
     }
 }
 
 impl GraphmanServerManager {
-    pub fn abort(self) {
-        self.handle.abort();
+    pub fn stop_server(self) {
+        self.notify.notify_one()
     }
 }
